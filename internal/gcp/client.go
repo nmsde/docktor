@@ -51,6 +51,20 @@ type Vulnerability struct {
 	Description     string
 }
 
+type LintResult struct {
+	Issues []LintIssue
+}
+
+type LintIssue struct {
+	Line        int    `json:"line"`
+	Column      int    `json:"column"`
+	Message     string `json:"message"`
+	Code        string `json:"code"`
+	Level       string `json:"level"`
+	File        string `json:"file"`
+	Description string `json:"description"`
+}
+
 func NewClient(projectID, serviceAccount, serviceKeyPath string) (*Client, error) {
 	ctx := context.Background()
 
@@ -786,4 +800,375 @@ func getFileSize(file *os.File) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+// getBuildLogs retrieves the logs from a Cloud Build operation
+func (c *Client) getBuildLogs(ctx context.Context, operationName string) (string, error) {
+	// Extract the build ID from the operation name
+	// Format: operations/build/{project-id}/builds/{build-id}/operations/{operation-id}
+	parts := strings.Split(operationName, "/")
+	if len(parts) < 6 {
+		return "", fmt.Errorf("invalid operation name format: %s", operationName)
+	}
+	buildID := parts[4]
+
+	// Get the build logs
+	build, err := c.buildService.Projects.Builds.Get(c.projectID, buildID).Context(ctx).Do()
+	if err != nil {
+		return "", fmt.Errorf("failed to get build: %w", err)
+	}
+
+	// Get the logs from the first step (Hadolint)
+	if len(build.Steps) == 0 {
+		return "", fmt.Errorf("no steps found in build")
+	}
+
+	// If the step status is empty, it means no issues were found
+	if build.Steps[0].Status == "" {
+		return "[]", nil
+	}
+
+	return build.Steps[0].Status, nil
+}
+
+// LintDockerfile runs Hadolint on a Dockerfile using Cloud Build
+func (c *Client) LintDockerfile(ctx context.Context, contextPath, dockerfilePath string) (*LintResult, error) {
+	// Create a unique build ID
+	buildID := fmt.Sprintf("docktor-lint-%d", time.Now().Unix())
+
+	// Get absolute path for Dockerfile
+	absDockerfilePath := dockerfilePath
+	if !filepath.IsAbs(dockerfilePath) {
+		absDockerfilePath = filepath.Join(contextPath, dockerfilePath)
+	}
+
+	// Read the Dockerfile content
+	dockerfileContent, err := os.ReadFile(absDockerfilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read Dockerfile: %w", err)
+	}
+
+	// Create a temporary file for the tar.gz archive
+	tmpFile, err := os.CreateTemp("", "docktor-lint-*.tar.gz")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Create gzip writer
+	gzipWriter := gzip.NewWriter(tmpFile)
+	defer gzipWriter.Close()
+
+	// Create tar writer
+	tarWriter := tar.NewWriter(gzipWriter)
+	defer tarWriter.Close()
+
+	// Create tar header for Dockerfile
+	header := &tar.Header{
+		Name: "Dockerfile",
+		Mode: 0644,
+		Size: int64(len(dockerfileContent)),
+	}
+
+	// Write header
+	if err := tarWriter.WriteHeader(header); err != nil {
+		return nil, fmt.Errorf("failed to write tar header: %w", err)
+	}
+
+	// Write Dockerfile content
+	if _, err := tarWriter.Write(dockerfileContent); err != nil {
+		return nil, fmt.Errorf("failed to write Dockerfile to tar: %w", err)
+	}
+
+	// Close writers to ensure all data is written
+	if err := tarWriter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close tar writer: %w", err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close gzip writer: %w", err)
+	}
+
+	// Reset file pointer to beginning
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return nil, fmt.Errorf("failed to reset file pointer: %w", err)
+	}
+
+	// Upload archive to Cloud Storage
+	bucketName := fmt.Sprintf("%s-docktor-builds", c.projectID)
+	bucket := c.storageClient.Bucket(bucketName)
+
+	// Create bucket if it doesn't exist
+	if _, err := bucket.Attrs(ctx); err != nil {
+		color.Yellow("📦 Creating new bucket: %s", bucketName)
+		if err := bucket.Create(ctx, c.projectID, nil); err != nil {
+			return nil, fmt.Errorf("failed to create bucket: %w", err)
+		}
+	}
+
+	obj := bucket.Object(fmt.Sprintf("%s/context.tar.gz", buildID))
+	writer := obj.NewWriter(ctx)
+
+	if _, err := io.Copy(writer, tmpFile); err != nil {
+		return nil, fmt.Errorf("failed to upload archive to Cloud Storage: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close Cloud Storage writer: %w", err)
+	}
+
+	// Create the build request
+	build := &cloudbuild.Build{
+		Steps: []*cloudbuild.BuildStep{
+			{
+				Name: "alpine",
+				Args: []string{
+					"sh",
+					"-c",
+					"apk add --no-cache curl && curl -sSfL https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64 -o /usr/local/bin/hadolint && chmod +x /usr/local/bin/hadolint && hadolint --format json --no-fail /workspace/Dockerfile > /workspace/lint-results.json",
+				},
+			},
+		},
+		Source: &cloudbuild.Source{
+			StorageSource: &cloudbuild.StorageSource{
+				Bucket: bucketName,
+				Object: fmt.Sprintf("%s/context.tar.gz", buildID),
+			},
+		},
+		Artifacts: &cloudbuild.Artifacts{
+			Objects: &cloudbuild.ArtifactObjects{
+				Location: fmt.Sprintf("gs://%s/%s", bucketName, buildID),
+				Paths:    []string{"lint-results.json"},
+			},
+		},
+		Options: &cloudbuild.BuildOptions{
+			Logging: "CLOUD_LOGGING_ONLY",
+		},
+	}
+
+	// Create the build
+	operation, err := c.buildService.Projects.Builds.Create(c.projectID, build).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create build: %w", err)
+	}
+
+	// Wait for the build to complete
+	fmt.Println("🔍 Running Hadolint on your Dockerfile...")
+	for {
+		time.Sleep(5 * time.Second)
+		operation, err = c.buildService.Operations.Get(operation.Name).Context(ctx).Do()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get build status: %w", err)
+		}
+
+		if operation.Done {
+			break
+		}
+	}
+
+	// Check if the build was successful
+	if operation.Error != nil {
+		return nil, fmt.Errorf("build failed: %s", operation.Error.Message)
+	}
+
+	// Get the lint results from Cloud Storage
+	obj = bucket.Object(fmt.Sprintf("%s/lint-results.json", buildID))
+	reader, err := obj.NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lint results: %w", err)
+	}
+	defer reader.Close()
+
+	// Read the entire content
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lint results content: %w", err)
+	}
+
+	// Create docktor directory if it doesn't exist
+	docktorDir := "docktor"
+	if err := os.MkdirAll(docktorDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create docktor directory: %w", err)
+	}
+
+	// Save the raw JSON file
+	rawJSONPath := filepath.Join(docktorDir, fmt.Sprintf("%s-lint-raw.json", buildID))
+	if err := os.WriteFile(rawJSONPath, content, 0644); err != nil {
+		return nil, fmt.Errorf("failed to save raw JSON file: %w", err)
+	}
+
+	// Parse the lint results
+	var issues []LintIssue
+	if err := json.Unmarshal(content, &issues); err != nil {
+		return nil, fmt.Errorf("failed to parse lint results: %w", err)
+	}
+
+	// Generate HTML report
+	htmlPath := filepath.Join(docktorDir, fmt.Sprintf("%s-lint-report.html", buildID))
+	htmlFile, err := os.Create(htmlPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTML report: %w", err)
+	}
+	defer htmlFile.Close()
+
+	// Write HTML header with styles
+	fmt.Fprintf(htmlFile, `<!DOCTYPE html>
+<html>
+<head>
+    <title>Dockerfile Lint Report - %s</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        .summary {
+            display: flex;
+            justify-content: space-around;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+        .level-card {
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px;
+            min-width: 200px;
+            text-align: center;
+            color: white;
+        }
+        .error { background-color: #dc3545; }
+        .warning { background-color: #fd7e14; }
+        .info { background-color: #20c997; }
+        .style { background-color: #6c757d; }
+        .issue {
+            margin-bottom: 20px;
+            padding: 20px;
+            border-radius: 8px;
+            background: #f8f9fa;
+        }
+        .issue.error { border-left: 5px solid #dc3545; }
+        .issue.warning { border-left: 5px solid #fd7e14; }
+        .issue.info { border-left: 5px solid #20c997; }
+        .issue.style { border-left: 5px solid #6c757d; }
+        .issue h3 {
+            margin-top: 0;
+            color: #495057;
+        }
+        .issue p {
+            margin: 5px 0;
+        }
+        .label {
+            font-weight: bold;
+            color: #495057;
+        }
+        .timestamp {
+            color: #6c757d;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Dockerfile Lint Report</h1>
+        <p class="timestamp">Generated on %s</p>
+    </div>
+
+    <div class="summary">
+`, buildID, time.Now().Format("January 2, 2006 15:04:05"))
+
+	// Group issues by level
+	issuesByLevel := make(map[string][]LintIssue)
+	for _, issue := range issues {
+		issuesByLevel[issue.Level] = append(issuesByLevel[issue.Level], issue)
+	}
+
+	// Write level summary
+	levelOrder := []string{"error", "warning", "info", "style"}
+	for _, level := range levelOrder {
+		if issues, ok := issuesByLevel[level]; ok {
+			fmt.Fprintf(htmlFile, `
+        <div class="level-card %s">
+            <h2>%s</h2>
+            <p>%d issues</p>
+        </div>`, level, strings.ToUpper(level), len(issues))
+		}
+	}
+
+	fmt.Fprintf(htmlFile, `
+    </div>
+
+    <div class="issues">`)
+
+	// Write detailed findings
+	for _, level := range levelOrder {
+		if issues, ok := issuesByLevel[level]; ok {
+			for _, issue := range issues {
+				fmt.Fprintf(htmlFile, `
+        <div class="issue %s">
+            <h3>%s</h3>
+            <p><span class="label">Line:</span> %d</p>
+            <p><span class="label">Code:</span> %s</p>
+            <p><span class="label">Message:</span> %s</p>
+            <p><span class="label">Description:</span> %s</p>
+        </div>`, 
+					level, issue.Message, issue.Line, issue.Code, issue.Message, issue.Description)
+			}
+		}
+	}
+
+	fmt.Fprintf(htmlFile, `
+    </div>
+</body>
+</html>`)
+
+	// Print results
+	if len(issues) == 0 {
+		color.Green("✅ No issues found in your Dockerfile!")
+	} else {
+		color.Yellow("⚠️  Found %d issues in your Dockerfile:", len(issues))
+		for _, issue := range issues {
+			fmt.Printf("  • Line %d: %s (%s)\n", issue.Line, issue.Message, issue.Code)
+		}
+	}
+
+	color.Green("\n✨ Lint report generated! View the results at: %s", htmlPath)
+
+	// Open the report in the default browser
+	absPath, err := filepath.Abs(htmlPath)
+	if err != nil {
+		fmt.Printf("Warning: Could not get absolute path for report: %v\n", err)
+		return &LintResult{Issues: issues}, nil
+	}
+
+	// Convert path to URL format
+	fileURL := fmt.Sprintf("file://%s", absPath)
+
+	// Open browser based on OS
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", fileURL)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", fileURL)
+	default: // "linux", "freebsd", etc.
+		cmd = exec.Command("xdg-open", fileURL)
+	}
+
+	if err := cmd.Start(); err != nil {
+		fmt.Printf("Warning: Could not open report in browser: %v\n", err)
+	}
+
+	return &LintResult{
+		Issues: issues,
+	}, nil
 } 

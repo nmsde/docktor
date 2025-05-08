@@ -1,14 +1,18 @@
 # Docktor
 
-A CLI tool for building and scanning Docker images in the cloud using Google Cloud Build. Docktor helps you build and scan your Docker images for vulnerabilities without having to install Docker or Trivy locally.
+Docktor is a CLI tool that helps you build, scan, and lint Docker images using Google Cloud Build. It offloads the heavy lifting of building and scanning Docker images to Google Cloud, making it faster and more efficient.
 
 ## Features
 
-- 🚀 Build Docker images in the cloud using Google Cloud Build
-- 🔍 Scan images for vulnerabilities using Trivy
-- 💰 Free tier usage (120 build-minutes per day)
-- 🔒 Secure handling of sensitive information
-- 🧹 Automatic cleanup of build artifacts
+- 🚀 Offload Docker builds to Google Cloud Build
+- 🔍 Scan Docker images for vulnerabilities using Trivy
+- 📊 Generate detailed HTML reports of scan results
+- 🎯 Lint Dockerfiles using Hadolint for best practices
+- 💾 Save scan results locally for future reference
+- 🔒 Secure handling of GCP credentials
+- 🎨 Beautiful and informative console output
+- 📦 Smart context handling with .gitignore support
+- 🖼️ Option to pull built images to local Docker daemon
 
 ## Prerequisites
 
@@ -86,51 +90,100 @@ Docktor supports two authentication methods:
 
 ## Usage
 
-### Building and Scanning an Image
+### Basic Usage
 
 ```bash
-# Build and scan using default Dockerfile in current directory
-docktor scan
-
-# Build and scan using a specific Dockerfile
-docktor scan --file path/to/Dockerfile
-
-# Build and scan using a specific build context
-docktor scan --context path/to/context
-```
-
-### Example
-
-```bash
-# Navigate to your project directory
-cd my-project
-
-# Initialize Docktor
+# Initialize Docktor with your GCP credentials
 docktor init
 
-# Build and scan your Docker image
-docktor scan
+# Build and scan a Docker image
+docktor scan --file path/to/Dockerfile --context .
+
+# Lint a Dockerfile for best practices
+docktor lint --file path/to/Dockerfile
+
+# Build an image without scanning
+docktor build --file path/to/Dockerfile --context .
 ```
 
-## Free Tier Usage
+### Advanced Usage
 
-Docktor is optimized to work within Google Cloud Build's free tier limits:
-- 120 build-minutes per day
-- Builds are automatically configured to use minimal resources
-- Build artifacts are automatically cleaned up to save storage
+```bash
+# Build and scan with a specific Dockerfile
+docktor scan --file path/to/Dockerfile --context .
 
-## How It Works
+# Build and scan, then pull the image locally
+docktor scan --file path/to/Dockerfile --context . --pull
 
-1. **Build Context Upload**: Your build context is compressed and uploaded to Google Cloud Storage
-2. **Cloud Build**: The image is built using Google Cloud Build
-3. **Vulnerability Scan**: The built image is scanned using Trivy
-4. **Results**: Scan results are displayed in your terminal
-5. **Cleanup**: Build artifacts are automatically cleaned up
+# Lint a Dockerfile in a specific context
+docktor lint 
 
-## Contributing
+docktor lint --file path/to/Dockerfile 
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+# Build an image and pull it locally
+docktor build --file path/to/Dockerfile --context . --pull
+```
 
-## License
+### Command Options
 
+#### Scan Command
+- `--file, -f`: Path to the Dockerfile (default: "Dockerfile")
+- `--context, -c`: Path to the build context (default: ".")
+- `--pull, -p`: Pull the built image to local Docker daemon
+
+#### Lint Command
+- `--file, -f`: Path to the Dockerfile (default: "Dockerfile")
+- `--context, -c`: Path to the build context (default: ".")
+
+#### Build Command
+- `--file, -f`: Path to the Dockerfile (default: "Dockerfile")
+- `--context, -c`: Path to the build context (default: ".")
+- `--pull, -p`: Pull the built image to local Docker daemon
+
+### Example Workflow
+
+1. Initialize Docktor:
+   ```bash
+   docktor init
+   ```
+   - Enter your GCP Project ID
+   - Enter your GCP Service Account
+   - Enter the path to your GCP Service Key
+   - Enter your GCP Region (default: "global")
+
+2. Lint your Dockerfile:
+   ```bash
+   docktor lint --file Dockerfile
+   ```
+   This will check your Dockerfile for best practices and common issues.
+
+3. Build and scan your image:
+   ```bash
+   docktor scan --file Dockerfile --context .
+   ```
+   This will:
+   - Build your Docker image in Google Cloud Build
+   - Scan it for vulnerabilities using Trivy
+   - Generate an HTML report
+   - Optionally pull the image if --pull is specified
+
+4. View the results:
+   - The scan results will be saved in the `docktor` directory
+   - An HTML report will be generated and opened in your default browser
+   - The lint results will be displayed in the console
+
+### Output Files
+
+The tool generates several files in the `docktor` directory:
+
+- `{buildID}-raw.json`: Raw JSON scan results
+- `{buildID}-report.html`: Formatted HTML report
+- `{buildID}-summary.txt`: Text summary of vulnerabilities
+
+### Build Context
+
+The tool handles the build context intelligently:
+- Excludes `node_modules` directories
+- Respects `.gitignore` patterns
+- Excludes hidden files and directories
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
