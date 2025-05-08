@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/nunoduarte/docktor/internal/config"
-	"github.com/nunoduarte/docktor/internal/gcp"
+	"github.com/nmsde/docktor/internal/config"
+	"github.com/nmsde/docktor/internal/gcp"
 	"github.com/spf13/cobra"
 )
 

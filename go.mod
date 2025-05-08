@@ -1,4 +1,4 @@
-module github.com/nunoduarte/docktor
+module github.com/nmsde/docktor
 
 go 1.21
 
